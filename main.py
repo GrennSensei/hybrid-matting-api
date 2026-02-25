@@ -7,7 +7,7 @@ from PIL import Image, ImageFilter
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
-app = FastAPI(title="Hybrid Matting API", version="1.2.0")
+app = FastAPI(title="Hybrid Matting API", version="1.3.0")
 
 # Render Free safe defaults
 MAX_SIDE_DEFAULT = 2048
@@ -56,7 +56,6 @@ def floodfill_white_border_mask(img_rgb: Image.Image, tol: int) -> bytearray:
 
     mask = bytearray(w * h)     # 1 = background connected to border
     visited = bytearray(w * h)
-
     q = deque()
 
     def idx(x, y):
@@ -112,11 +111,9 @@ def build_bg_map_lowres(img: Image.Image, blur_radius: float, bg_map_side: int) 
 def health():
     return {"status": "ok", "endpoint": "/matte/hybrid"}
 
-
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Minimal UI like the previous difference-matting API
-    return f"""
+    return """
 <!doctype html>
 <html>
   <head>
@@ -124,14 +121,14 @@ def home():
     <title>Hybrid Matting Test</title>
   </head>
   <body style="font-family: Arial; max-width: 980px; margin: 40px auto; line-height:1.45;">
-    <h2>Hybrid Matting Test</h2>
+    <h2>Hybrid Matting Test (anti-wear)</h2>
     <p>
-      Upload the <b>white background</b> and <b>black background</b> versions of the same artwork (pixel-aligned).
+      Upload a <b>white</b> and <b>black</b> version of the same artwork (pixel-aligned).
       <br/>
-      <b>Hybrid logic:</b> border-connected background removed by floodfill + inner details refined by difference matting.
+      Hybrid: floodfill removes outer background + difference matting refines inner edges.
     </p>
 
-    <form action="/matte/hybrid?max_side=2048&flood_tolerance=60&bg_blur=18&bg_map_side=512&noise_cut=0.02"
+    <form action="/matte/hybrid?max_side=2048&flood_tolerance=60&bg_blur=12&bg_map_side=512&noise_cut=0.015&denom_min=12&fg_protect=1&fg_margin=18"
           method="post" enctype="multipart/form-data"
           style="padding:16px; border:1px solid #ddd; border-radius:10px;">
       <p><b>White image (near #FFFFFF):</b></p>
@@ -149,21 +146,17 @@ def home():
 
     <hr style="margin: 22px 0; border: none; border-top: 1px solid #eee;" />
 
-    <h3 style="margin-bottom:6px;">Quick tuning</h3>
+    <h3 style="margin-bottom:6px;">Key knobs</h3>
     <ul style="margin-top:6px; color:#444;">
-      <li><b>noise_cut</b> (0.01–0.03): lower keeps more delicate details; higher removes more dust.</li>
-      <li><b>flood_tolerance</b> (50–85): higher removes more border background, but can eat very pale edge pixels.</li>
-      <li><b>bg_blur</b> (12–24): helps with gradients; too high can soften alpha math.</li>
-      <li><b>max_side</b> (1600–2048): Render Free safe. 3000 may OOM.</li>
+      <li><b>noise_cut</b> (0.01–0.03): too high can eat internal texture.</li>
+      <li><b>bg_blur</b> (8–16): lower reduces “bleeding into design”.</li>
+      <li><b>denom_min</b> (8–20): higher = less aggressive alpha drops when bg difference is weak.</li>
+      <li><b>fg_protect</b> + <b>fg_margin</b>: prevents “worn out / sandblasted” interiors.</li>
     </ul>
 
     <p style="color:#777;">
-      Tip: If details are missing, try <b>noise_cut=0.015</b> and <b>flood_tolerance=55</b>.
-      If background dust remains, try <b>noise_cut=0.03</b> and <b>flood_tolerance=70</b>.
-    </p>
-
-    <p style="color:#888; font-size: 13px;">
-      API: POST <code>/matte/hybrid</code> — OpenAPI: <code>/docs</code>
+      If the design still looks worn: increase <b>fg_margin</b> (18→24) or <b>denom_min</b> (12→16).
+      If background dust remains: increase <b>noise_cut</b> slightly (0.015→0.02) or raise <b>flood_tolerance</b> (60→70).
     </p>
   </body>
 </html>
@@ -181,9 +174,18 @@ async def hybrid_matte(
     flood_tolerance: int = Query(60, ge=0, le=255),
 
     # Difference matting (inner detail)
-    bg_blur: float = Query(18.0, ge=0.0, le=64.0),
+    bg_blur: float = Query(12.0, ge=0.0, le=64.0),
     bg_map_side: int = Query(BG_MAP_SIDE_DEFAULT, ge=128, le=1024),
-    noise_cut: float = Query(0.02, ge=0.0, le=0.2),
+
+    # This is important to avoid aggressive alpha drops
+    denom_min: float = Query(12.0, ge=1.0, le=64.0),
+
+    # noise cleanup
+    noise_cut: float = Query(0.015, ge=0.0, le=0.2),
+
+    # Foreground protection (anti-wear)
+    fg_protect: int = Query(1, ge=0, le=1),
+    fg_margin: float = Query(18.0, ge=0.0, le=80.0),
 ):
     try:
         img_w = Image.open(io.BytesIO(await white_file.read())).convert("RGB")
@@ -195,40 +197,76 @@ async def hybrid_matte(
         if img_w.size != img_b.size:
             return JSONResponse(status_code=400, content={"error": "Images must match size (pixel-aligned)."})
 
-        # 1) Floodfill mask on WHITE image (outer bg removal)
-        flood_mask = floodfill_white_border_mask(img_w, tol=flood_tolerance)
+        w, h = img_w.size
 
-        # 2) Difference alpha (background-aware, low-res bg map)
+        # 1) Floodfill mask on WHITE image (outer bg removal)
+        flood_mask_1d = floodfill_white_border_mask(img_w, tol=flood_tolerance)
+        bg2d = (np.frombuffer(flood_mask_1d, dtype=np.uint8).reshape(h, w) == 1)
+
+        # 2) Arrays
         W = pil_to_f16(img_w)
         B = pil_to_f16(img_b)
 
+        # 3) Background maps (low-res, less blur by default to avoid bleeding)
         BgW = pil_to_f16(build_bg_map_lowres(img_w, blur_radius=bg_blur, bg_map_side=bg_map_side))
         BgB = pil_to_f16(build_bg_map_lowres(img_b, blur_radius=bg_blur, bg_map_side=bg_map_side))
 
-        denom = (BgW - BgB)
-        denom_safe = np.where(np.abs(denom) < 1.0, np.sign(denom) * 1.0, denom).astype(np.float16)
+        # -------------------------------------------------
+        # 4) Difference alpha — conservative version
+        #    A) channel-based (median) AND
+        #    B) distance-based
+        #    Use MAX of both (prevents "worn out" interiors)
+        # -------------------------------------------------
+
+        # A) channel/median alpha
+        denom = (BgW - BgB)  # f16
+        denom_safe = np.where(np.abs(denom) < np.float16(denom_min),
+                              np.sign(denom) * np.float16(denom_min),
+                              denom).astype(np.float16)
 
         alpha_rgb = np.float16(1.0) - ((W - B) / denom_safe)
-        alpha = np.median(alpha_rgb, axis=2)
-        alpha = np.clip(alpha, 0.0, 1.0).astype(np.float16)
+        alpha_med = np.median(alpha_rgb, axis=2)
+        alpha_med = np.clip(alpha_med, 0.0, 1.0).astype(np.float16)
 
-        # noise cut
+        # B) distance alpha (more stable on texture/noise)
+        # use float32 temporarily for sqrt stability
+        diff32 = (W.astype(np.float32) - B.astype(np.float32))
+        pix_dist = np.sqrt((diff32 * diff32).sum(axis=2))
+
+        bgdiff32 = (BgW.astype(np.float32) - BgB.astype(np.float32))
+        bg_dist = np.sqrt((bgdiff32 * bgdiff32).sum(axis=2))
+        bg_dist = np.maximum(bg_dist, float(denom_min))
+
+        alpha_dist = 1.0 - (pix_dist / bg_dist)
+        alpha_dist = np.clip(alpha_dist, 0.0, 1.0).astype(np.float16)
+
+        # Conservative merge
+        alpha = np.maximum(alpha_med, alpha_dist).astype(np.float16)
+
+        # cleanup temps
+        del denom, denom_safe, alpha_rgb, alpha_med, diff32, pix_dist, bgdiff32, bg_dist, alpha_dist
+        gc.collect()
+
+        # 5) Noise cut (keep low by default)
         if noise_cut > 0:
             alpha = np.where(alpha < np.float16(noise_cut), np.float16(0.0), alpha).astype(np.float16)
 
-        # 3) Hybrid merge: force outer bg to 0 alpha using flood mask
-        alpha_u8 = alpha_to_u8(alpha)
-        w, h = img_w.size
-        i = 0
-        for y in range(h):
-            for x in range(w):
-                if flood_mask[i] == 1:
-                    alpha_u8[y, x] = 0
-                i += 1
+        # 6) Foreground protection: if pixel clearly differs from background, force alpha=1 (ONLY outside bg)
+        if fg_protect == 1 and fg_margin > 0:
+            # max per-channel deviation from bg
+            dev_w = np.max(np.abs(W - BgW), axis=2)  # f16
+            dev_b = np.max(np.abs(B - BgB), axis=2)  # f16
+            fg_conf = (dev_w > np.float16(fg_margin)) | (dev_b > np.float16(fg_margin))
+            alpha = np.where((~bg2d) & fg_conf, np.float16(1.0), alpha).astype(np.float16)
+            del dev_w, dev_b, fg_conf
+            gc.collect()
 
+        # 7) Hybrid merge: force outer bg to 0 alpha using flood mask
+        alpha_u8 = alpha_to_u8(alpha)
+        alpha_u8[bg2d] = 0
         alpha = u8_to_alpha01(alpha_u8)
 
-        # 4) Color recovery (background-aware)
+        # 8) Color recovery (background-aware)
         a_safe = np.maximum(alpha, np.float16(1e-3))[..., None]
         out_rgb = (B - (np.float16(1.0) - alpha)[..., None] * BgB) / a_safe
         out_rgb = np.clip(out_rgb, 0.0, 255.0)
@@ -238,7 +276,7 @@ async def hybrid_matte(
         out.putalpha(Image.fromarray(alpha_to_u8(alpha), mode="L"))
 
         # free big arrays early
-        del W, B, BgW, BgB, denom, denom_safe, alpha_rgb, out_rgb
+        del W, B, BgW, BgB, out_rgb, alpha, alpha_u8, bg2d, flood_mask_1d
         gc.collect()
 
         return StreamingResponse(io.BytesIO(png_bytes(out)), media_type="image/png")
