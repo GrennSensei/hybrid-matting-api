@@ -5,9 +5,9 @@ from collections import deque
 import numpy as np
 from PIL import Image, ImageFilter
 from fastapi import FastAPI, UploadFile, File, Query
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
-app = FastAPI(title="Hybrid Matting API", version="1.1.0")
+app = FastAPI(title="Hybrid Matting API", version="1.2.0")
 
 # Render Free safe defaults
 MAX_SIDE_DEFAULT = 2048
@@ -108,22 +108,67 @@ def build_bg_map_lowres(img: Image.Image, blur_radius: float, bg_map_side: int) 
 # Routes
 # =========================================================
 
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "service": "hybrid-matting-api",
-        "endpoints": {
-            "health": "/health",
-            "docs": "/docs",
-            "hybrid": "POST /matte/hybrid"
-        },
-        "note": "Open /docs to test. Root / returns JSON, not the PNG."
-    }
-
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "endpoint": "/matte/hybrid"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    # Minimal UI like the previous difference-matting API
+    return f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Hybrid Matting Test</title>
+  </head>
+  <body style="font-family: Arial; max-width: 980px; margin: 40px auto; line-height:1.45;">
+    <h2>Hybrid Matting Test</h2>
+    <p>
+      Upload the <b>white background</b> and <b>black background</b> versions of the same artwork (pixel-aligned).
+      <br/>
+      <b>Hybrid logic:</b> border-connected background removed by floodfill + inner details refined by difference matting.
+    </p>
+
+    <form action="/matte/hybrid?max_side=2048&flood_tolerance=60&bg_blur=18&bg_map_side=512&noise_cut=0.02"
+          method="post" enctype="multipart/form-data"
+          style="padding:16px; border:1px solid #ddd; border-radius:10px;">
+      <p><b>White image (near #FFFFFF):</b></p>
+      <input type="file" name="white_file" accept="image/*" required />
+
+      <p style="margin-top:14px;"><b>Black image (near #000000):</b></p>
+      <input type="file" name="black_file" accept="image/*" required />
+
+      <p style="margin-top:14px;">
+        <button type="submit" style="padding:10px 14px; font-weight:bold; cursor:pointer;">
+          Generate Transparent PNG
+        </button>
+      </p>
+    </form>
+
+    <hr style="margin: 22px 0; border: none; border-top: 1px solid #eee;" />
+
+    <h3 style="margin-bottom:6px;">Quick tuning</h3>
+    <ul style="margin-top:6px; color:#444;">
+      <li><b>noise_cut</b> (0.01–0.03): lower keeps more delicate details; higher removes more dust.</li>
+      <li><b>flood_tolerance</b> (50–85): higher removes more border background, but can eat very pale edge pixels.</li>
+      <li><b>bg_blur</b> (12–24): helps with gradients; too high can soften alpha math.</li>
+      <li><b>max_side</b> (1600–2048): Render Free safe. 3000 may OOM.</li>
+    </ul>
+
+    <p style="color:#777;">
+      Tip: If details are missing, try <b>noise_cut=0.015</b> and <b>flood_tolerance=55</b>.
+      If background dust remains, try <b>noise_cut=0.03</b> and <b>flood_tolerance=70</b>.
+    </p>
+
+    <p style="color:#888; font-size: 13px;">
+      API: POST <code>/matte/hybrid</code> — OpenAPI: <code>/docs</code>
+    </p>
+  </body>
+</html>
+"""
+
 
 @app.post("/matte/hybrid")
 async def hybrid_matte(
@@ -149,7 +194,6 @@ async def hybrid_matte(
 
         if img_w.size != img_b.size:
             return JSONResponse(status_code=400, content={"error": "Images must match size (pixel-aligned)."})
-
 
         # 1) Floodfill mask on WHITE image (outer bg removal)
         flood_mask = floodfill_white_border_mask(img_w, tol=flood_tolerance)
