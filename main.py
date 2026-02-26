@@ -6,7 +6,7 @@ from PIL import Image, ImageFilter
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
-app = FastAPI(title="Hybrid Matting API (Floodfill + Hole Diff + Fringe Fix)", version="2.1.0")
+app = FastAPI(title="Hybrid Matting API (Floodfill + Hole Diff + Edge-safe Fringe Fix)", version="2.2.0")
 
 MAX_SIDE_DEFAULT = 2048
 
@@ -32,10 +32,14 @@ def is_near_white_rgb(px, tol: int) -> bool:
     r, g, b = px
     return abs(r - 255) <= tol and abs(g - 255) <= tol and abs(b - 255) <= tol
 
+def luma_u8(px) -> float:
+    # Perceptual-ish luminance
+    r, g, b = px
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
 
 # =========================================================
 # Two-stage floodfill from border (memory-safe 1D)
-# (same spirit as your proven remover) :contentReference[oaicite:1]{index=1}
 # =========================================================
 
 def floodfill_border_bg_mask_two_stage_1d(img_for_keying: Image.Image, tol_strict: int, tol_relaxed: int) -> bytearray:
@@ -53,7 +57,6 @@ def floodfill_border_bg_mask_two_stage_1d(img_for_keying: Image.Image, tol_stric
             mask[i] = 1
             q.append((x, y))
 
-    # strict seeds on border
     for x in range(w):
         try_seed_strict(x, 0)
         try_seed_strict(x, h - 1)
@@ -61,7 +64,6 @@ def floodfill_border_bg_mask_two_stage_1d(img_for_keying: Image.Image, tol_stric
         try_seed_strict(0, y)
         try_seed_strict(w - 1, y)
 
-    # relaxed expansion from strict border-connected seeds
     while q:
         x, y = q.popleft()
         for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
@@ -76,11 +78,9 @@ def floodfill_border_bg_mask_two_stage_1d(img_for_keying: Image.Image, tol_stric
 
 # =========================================================
 # Find enclosed transparent holes (inside FG) using 1D BFS
-# Holes = bg pixels NOT connected to border
 # =========================================================
 
 def find_enclosed_holes(alpha_bg_1d: bytearray, w: int, h: int, min_area: int):
-    # alpha_bg_1d: 1 where bg/transparent, 0 where fg/opaque
     def idx(x, y): return y * w + x
 
     visited = bytearray(w * h)
@@ -92,7 +92,6 @@ def find_enclosed_holes(alpha_bg_1d: bytearray, w: int, h: int, min_area: int):
             visited[i] = 1
             q.append((x, y))
 
-    # mark border-connected bg
     for x in range(w):
         enqueue_if_bg(x, 0)
         enqueue_if_bg(x, h - 1)
@@ -109,7 +108,6 @@ def find_enclosed_holes(alpha_bg_1d: bytearray, w: int, h: int, min_area: int):
                     visited[i] = 1
                     q.append((nx, ny))
 
-    # find enclosed bg comps (holes)
     holes = []
     hole_vis = bytearray(w * h)
 
@@ -145,7 +143,6 @@ def find_enclosed_holes(alpha_bg_1d: bytearray, w: int, h: int, min_area: int):
 
 # =========================================================
 # Difference alpha (used ONLY for holes decision)
-# alpha = 1 - ||W-B|| / ||bgW-bgB||, bgW/bgB from border bg median
 # =========================================================
 
 def estimate_bg_rgb_from_border_mask(img_rgb_u8: np.ndarray, border_bg_1d: bytearray) -> np.ndarray:
@@ -172,17 +169,24 @@ def compute_alpha_dist(W_u8: np.ndarray, B_u8: np.ndarray, bgW: np.ndarray, bgB:
 
 
 # =========================================================
-# Edge / halo killer: remove near-white opaque pixels adjacent to transparency
-# (fixes the thin white pixel line you showed)
+# Edge-safe fringe killer
+# - only near-white pixels adjacent to bg
+# - BUT protect dark contour pixels by luma threshold
 # =========================================================
 
-def fringe_kill_near_white(alpha_bg_1d: bytearray, img_w_rgb: Image.Image, tol: int, passes: int) -> int:
+def fringe_kill_near_white_edge_safe(
+    alpha_bg_1d: bytearray,
+    img_w_rgb: Image.Image,
+    tol: int,
+    passes: int,
+    protect_dark_luma: float,
+) -> int:
     """
     alpha_bg_1d: 1 = bg (transparent), 0 = fg (opaque)
-    We convert certain fg pixels to bg if:
-      - pixel color is near-white (within tol)
-      - and it touches bg in 4-neighborhood
-    Returns number of pixels flipped.
+    Flip FG->BG only if:
+      - near-white (tol)
+      - touches BG
+      - AND NOT "dark" (luma >= protect_dark_luma)
     """
     if passes <= 0:
         return 0
@@ -200,9 +204,17 @@ def fringe_kill_near_white(alpha_bg_1d: bytearray, img_w_rgb: Image.Image, tol: 
                 i = idx(x, y)
                 if alpha_bg_1d[i] == 1:
                     continue  # already bg
-                # candidate only if near-white
-                if not is_near_white_rgb(pix[x, y], tol):
+
+                px = pix[x, y]
+
+                # PROTECT contours: if dark enough, never delete it
+                if luma_u8(px) < protect_dark_luma:
                     continue
+
+                # candidate only if near-white
+                if not is_near_white_rgb(px, tol):
+                    continue
+
                 # must touch background
                 touch_bg = False
                 if x > 0 and alpha_bg_1d[idx(x - 1, y)] == 1: touch_bg = True
@@ -238,14 +250,14 @@ def home():
 <html>
   <head><meta charset="utf-8"><title>Hybrid Matting Test</title></head>
   <body style="font-family: Arial; max-width: 980px; margin: 40px auto; line-height:1.45;">
-    <h2>Hybrid Matting Test (Floodfill outer + Diff holes + Fringe fix)</h2>
+    <h2>Hybrid Matting Test (Sharp contours)</h2>
     <p>
-      Külső háttér: bevált two-stage floodfill (BoxBlur 0.6) + finom élkezelés.
-      <br/>Belső lyukak: difference matting csak a lyuk pixelekre.
-      <br/>Plusz: “fringe killer” a vékony fehér pixelsor ellen.
+      Külső háttér: two-stage floodfill (BoxBlur 0.6).<br/>
+      Lyukak: difference csak a belső hole pixelekre.<br/>
+      Kontúr-élesség: edge-safe fringe killer (nem harap bele a sötét kontúrba).
     </p>
 
-    <form action="/matte/hybrid?max_side=2048&tol_strict=35&tol_relaxed=60&erode_px=1&fringe_tol=55&fringe_passes=1&hole_fill=1&min_hole_area=120&hole_alpha_thresh=0.18&debug=0"
+    <form action="/matte/hybrid?max_side=2048&tol_strict=35&tol_relaxed=60&erode_px=0&fringe_tol=55&fringe_passes=1&protect_dark_luma=130&hole_fill=1&min_hole_area=120&hole_alpha_thresh=0.18&debug=0"
           method="post" enctype="multipart/form-data"
           style="padding:16px; border:1px solid #ddd; border-radius:10px;">
       <p><b>White image:</b></p>
@@ -262,8 +274,8 @@ def home():
     </form>
 
     <p style="color:#777; margin-top:14px;">
-      Fehér pixelsor marad? emeld <b>fringe_tol</b>-t (55→70) vagy <b>fringe_passes</b>-t (1→2).
-      <br/>Ha a kontúrból is “harap”: csökkentsd <b>fringe_tol</b>-t (55→45) és hagyd a <b>erode_px</b>=1-et.
+      Ha még harap: emeld <b>protect_dark_luma</b>-t (130→150), vagy csökkentsd <b>fringe_tol</b>-t (55→45).<br/>
+      Ha visszajön a fehér csík: csökkentsd <b>protect_dark_luma</b>-t (130→110) vagy emeld <b>fringe_tol</b>-t (55→70).
     </p>
   </body>
 </html>
@@ -275,24 +287,23 @@ async def hybrid_matte(
     white_file: UploadFile = File(...),
     black_file: UploadFile = File(...),
 
-    # perf
     max_side: int = Query(MAX_SIDE_DEFAULT, ge=512, le=6000),
 
-    # proven outer bg remover knobs (like your working version) :contentReference[oaicite:2]{index=2}
+    # outer bg remover (proven setup)
     tol_strict: int = Query(35, ge=0, le=255),
     tol_relaxed: int = Query(60, ge=0, le=255),
-    erode_px: int = Query(1, ge=0, le=6),
+    erode_px: int = Query(0, ge=0, le=6),  # DEFAULT 0 to avoid contour bite
 
-    # fringe killer (NEW)
+    # fringe killer
     fringe_tol: int = Query(55, ge=0, le=255),
     fringe_passes: int = Query(1, ge=0, le=4),
+    protect_dark_luma: float = Query(130.0, ge=0.0, le=255.0),
 
-    # holes via difference (only for enclosed holes)
+    # holes via difference
     hole_fill: int = Query(1, ge=0, le=1),
     min_hole_area: int = Query(120, ge=1, le=500000),
     hole_alpha_thresh: float = Query(0.18, ge=0.0, le=1.0),
 
-    # debug
     debug: int = Query(0, ge=0, le=1),
 ):
     try:
@@ -308,21 +319,15 @@ async def hybrid_matte(
 
         w, h = img_w.size
 
-        # 1) floodfill on key image (BoxBlur 0.6) :contentReference[oaicite:3]{index=3}
+        # 1) floodfill on key image (BoxBlur 0.6)
         img_key = img_w.filter(ImageFilter.BoxBlur(0.6))
         if tol_strict >= tol_relaxed:
             tol_strict = max(10, tol_relaxed - 30)
 
-        border_bg_1d = floodfill_border_bg_mask_two_stage_1d(
-            img_for_keying=img_key,
-            tol_strict=tol_strict,
-            tol_relaxed=tol_relaxed,
-        )
+        border_bg_1d = floodfill_border_bg_mask_two_stage_1d(img_key, tol_strict=tol_strict, tol_relaxed=tol_relaxed)
+        alpha_bg_1d = border_bg_1d[:]  # 1=bg, 0=fg
 
-        # alpha_bg_1d: 1=bg (transparent), 0=fg (opaque)
-        alpha_bg_1d = border_bg_1d[:]  # copy
-
-        # 2) optional hole fill using difference alpha (ONLY on enclosed holes)
+        # 2) optional hole fill using difference (ONLY inside enclosed holes)
         filled_hole_px = 0
         hole_components = 0
 
@@ -336,22 +341,20 @@ async def hybrid_matte(
             if hole_components > 0:
                 bgW = estimate_bg_rgb_from_border_mask(W_u8, border_bg_1d)
                 bgB = estimate_bg_rgb_from_border_mask(B_u8, border_bg_1d)
-                alpha_diff = compute_alpha_dist(W_u8, B_u8, bgW=bgW, bgB=bgB)  # [H,W]
+                alpha_diff = compute_alpha_dist(W_u8, B_u8, bgW=bgW, bgB=bgB)
 
                 for comp in holes:
                     for ii in comp:
                         x = ii % w
                         y = ii // w
                         if alpha_diff[y, x] >= hole_alpha_thresh:
-                            alpha_bg_1d[ii] = 0  # make opaque
+                            alpha_bg_1d[ii] = 0
                             filled_hole_px += 1
 
-        # 3) Erode (halo killer) :contentReference[oaicite:4]{index=4}
-        # Implement erosion on alpha_bg_1d (shrink FG slightly).
+        # 3) optional erode (OFF by default to keep contours sharp)
         if erode_px > 0:
             def idx(x, y): return y * w + x
 
-            # build fg mask (1 where fg)
             fg = bytearray(w * h)
             for i in range(w * h):
                 fg[i] = 1 if alpha_bg_1d[i] == 0 else 0
@@ -362,21 +365,21 @@ async def hybrid_matte(
                     for x in range(w):
                         i = idx(x, y)
                         if fg[i] == 1:
-                            # if touches bg => clear it
                             if (x > 0 and fg[idx(x - 1, y)] == 0) or (x < w - 1 and fg[idx(x + 1, y)] == 0) or \
                                (y > 0 and fg[idx(x, y - 1)] == 0) or (y < h - 1 and fg[idx(x, y + 1)] == 0):
                                 to_clear.append(i)
                 for i in to_clear:
                     fg[i] = 0
 
-            # write back to alpha_bg_1d
             for i in range(w * h):
                 alpha_bg_1d[i] = 0 if fg[i] == 1 else 1
 
-        # 4) NEW: Fringe killer (removes near-white opaque pixels adjacent to bg)
-        flipped_fringe = fringe_kill_near_white(alpha_bg_1d, img_w, tol=fringe_tol, passes=fringe_passes)
+        # 4) edge-safe fringe kill (removes white halo WITHOUT biting dark contour)
+        flipped_fringe = fringe_kill_near_white_edge_safe(
+            alpha_bg_1d, img_w, tol=fringe_tol, passes=fringe_passes, protect_dark_luma=protect_dark_luma
+        )
 
-        # 5) Build RGBA using WHITE colors (no color recovery => no distortion)
+        # 5) build RGBA using WHITE colors (no color recovery => no distortion)
         out = img_w.convert("RGBA")
         p = out.load()
 
@@ -397,20 +400,18 @@ async def hybrid_matte(
                 "hole_pixels_filled": filled_hole_px,
                 "fringe_pixels_removed": flipped_fringe,
                 "params": {
-                    "max_side": max_side,
                     "tol_strict": tol_strict,
                     "tol_relaxed": tol_relaxed,
                     "erode_px": erode_px,
                     "fringe_tol": fringe_tol,
                     "fringe_passes": fringe_passes,
-                    "hole_fill": hole_fill,
-                    "min_hole_area": min_hole_area,
+                    "protect_dark_luma": protect_dark_luma,
                     "hole_alpha_thresh": hole_alpha_thresh,
+                    "min_hole_area": min_hole_area
                 },
                 "tuning": {
-                    "white_fringe_left": "emeld fringe_tol (55→70) vagy fringe_passes (1→2)",
-                    "contour_gets_eaten": "csökkentsd fringe_tol (55→45), és hagyd erode_px=1",
-                    "holes_left": "csökkentsd hole_alpha_thresh (0.18→0.14) vagy min_hole_area (120→60)",
+                    "if_contour_bitten": "protect_dark_luma 130→150 OR fringe_tol 55→45",
+                    "if_white_halo_returns": "protect_dark_luma 130→110 OR fringe_tol 55→70"
                 }
             })
 
