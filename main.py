@@ -6,7 +6,7 @@ from PIL import Image, ImageFilter
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
-app = FastAPI(title="Hybrid Matting API (Floodfill + Hole Diff RGB Fix)", version="2.3.0")
+app = FastAPI(title="Hybrid Matting API (Floodfill + Hole Diff RGB Fix)", version="2.3.1")
 
 MAX_SIDE_DEFAULT = 2048
 
@@ -229,13 +229,13 @@ def home():
 <html>
   <head><meta charset="utf-8"><title>Hybrid Matting Test</title></head>
   <body style="font-family: Arial; max-width: 980px; margin: 40px auto; line-height:1.45;">
-    <h2>Hybrid Matting Test (Fix holes RGB)</h2>
+    <h2>Hybrid Matting Test (Final defaults)</h2>
     <p>
       Külső háttér: two-stage floodfill (BoxBlur 0.6) + edge-safe fringe fix.<br/>
       Hole-ok: difference alapján nem csak alpha-t, hanem RGB-t is javítunk (csak hole pixelekben).
     </p>
 
-    <form action="/matte/hybrid?max_side=2048&tol_strict=35&tol_relaxed=60&fringe_tol=55&fringe_passes=1&protect_dark_luma=130&hole_fill=1&min_hole_area=120&hole_alpha_thresh=0.18&hole_alpha_min=0.65&debug=0"
+    <form action="/matte/hybrid?max_side=2048&tol_strict=35&tol_relaxed=60&fringe_tol=55&fringe_passes=1&protect_dark_luma=130&hole_fill=1&min_hole_area=100&hole_alpha_thresh=0.14&hole_alpha_min=0.75&debug=0"
           method="post" enctype="multipart/form-data"
           style="padding:16px; border:1px solid #ddd; border-radius:10px;">
       <p><b>White image:</b></p>
@@ -252,8 +252,8 @@ def home():
     </form>
 
     <p style="color:#777; margin-top:14px;">
-      Ha hole-ban még látszik a háttér: emeld <b>hole_alpha_min</b>-t (0.65→0.75) vagy csökkentsd <b>hole_alpha_thresh</b>-t (0.18→0.14).<br/>
-      Ha túl sok mindent “átfest” hole-ban: emeld <b>hole_alpha_thresh</b>-t (0.18→0.22).
+      Ha hole-ban még látszik háttér: emeld <b>hole_alpha_min</b>-t (0.75→0.85) vagy csökkentsd <b>hole_alpha_thresh</b>-t (0.14→0.12).<br/>
+      Ha rossz helyen is kitölt: emeld <b>hole_alpha_thresh</b>-t (0.14→0.18) vagy emeld <b>min_hole_area</b>-t (100→160).
     </p>
   </body>
 </html>
@@ -275,11 +275,11 @@ async def hybrid_matte(
     protect_dark_luma: float = Query(130.0, ge=0.0, le=255.0),
 
     hole_fill: int = Query(1, ge=0, le=1),
-    min_hole_area: int = Query(120, ge=1, le=500000),
-    hole_alpha_thresh: float = Query(0.18, ge=0.0, le=1.0),
 
-    # NEW: stabilize RGB recovery inside holes
-    hole_alpha_min: float = Query(0.65, ge=0.05, le=1.0),
+    # ✅ Updated defaults (as requested)
+    min_hole_area: int = Query(100, ge=1, le=500000),
+    hole_alpha_thresh: float = Query(0.14, ge=0.0, le=1.0),
+    hole_alpha_min: float = Query(0.75, ge=0.05, le=1.0),
 
     debug: int = Query(0, ge=0, le=1),
 ):
@@ -310,7 +310,7 @@ async def hybrid_matte(
         W_u8 = np.array(img_w, dtype=np.uint8)
         B_u8 = np.array(img_b, dtype=np.uint8)
 
-        # We'll build output RGB as a mutable array from WHITE (no global color recovery)
+        # Output RGB starts from WHITE (no global color recovery)
         out_rgb = W_u8.copy()
 
         # 3) hole fill using difference + RGB recovery ONLY for hole pixels
@@ -328,6 +328,8 @@ async def hybrid_matte(
 
                 alpha_diff = compute_alpha_dist(W_u8, B_u8, bgW=bgW, bgB=bgB)  # [H,W] float32
 
+                bgB_f = bgB.astype(np.float32)
+
                 for comp in holes:
                     for ii in comp:
                         x = ii % w
@@ -341,20 +343,17 @@ async def hybrid_matte(
                         alpha_bg_1d[ii] = 0
                         hole_pixels_filled += 1
 
-                        # RGB recovery ONLY here (avoid "white background showing through")
-                        # Use stabilized alpha to avoid blow-ups
+                        # RGB recovery ONLY here
                         a_use = max(a, hole_alpha_min)
 
-                        # C = (B - (1-a)*BgB) / a
-                        # BgB constant estimate from border background
                         Bpx = B_u8[y, x].astype(np.float32)
-                        C = (Bpx - (1.0 - a_use) * bgB.astype(np.float32)) / a_use
+                        C = (Bpx - (1.0 - a_use) * bgB_f) / a_use
                         C = np.clip(C, 0.0, 255.0).astype(np.uint8)
 
                         out_rgb[y, x] = C
                         hole_pixels_rgb_fixed += 1
 
-        # 4) edge-safe fringe killer (removes thin near-white line without biting contour)
+        # 4) edge-safe fringe killer
         flipped_fringe = fringe_kill_near_white_edge_safe(
             alpha_bg_1d, img_w, tol=fringe_tol, passes=fringe_passes, protect_dark_luma=protect_dark_luma
         )
@@ -388,10 +387,6 @@ async def hybrid_matte(
                     "hole_alpha_thresh": hole_alpha_thresh,
                     "hole_alpha_min": hole_alpha_min,
                     "min_hole_area": min_hole_area
-                },
-                "tips": {
-                    "if_holes_still_show_bg": "emeld hole_alpha_min (0.65→0.75) vagy csökkentsd hole_alpha_thresh (0.18→0.14)",
-                    "if_wrong_fill_inside_design": "emeld hole_alpha_thresh (0.18→0.22) vagy emeld min_hole_area-t"
                 }
             })
 
