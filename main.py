@@ -7,7 +7,7 @@ from PIL import Image, ImageFilter
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
-app = FastAPI(title="Hybrid Matting API", version="1.4.0")
+app = FastAPI(title="Hybrid Matting API", version="1.5.0")
 
 # Render Free safe defaults
 MAX_SIDE_DEFAULT = 2048
@@ -15,7 +15,7 @@ BG_MAP_SIDE_DEFAULT = 512
 
 
 # =========================================================
-# Small utils
+# Utils
 # =========================================================
 
 def resize_max(img: Image.Image, max_side: int) -> Image.Image:
@@ -26,8 +26,10 @@ def resize_max(img: Image.Image, max_side: int) -> Image.Image:
     nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
     return img.resize((nw, nh), Image.LANCZOS)
 
-def pil_to_f16(img: Image.Image) -> np.ndarray:
-    return np.array(img, dtype=np.uint8).astype(np.float16)
+def png_bytes(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 def alpha_to_u8(alpha01: np.ndarray) -> np.ndarray:
     return (np.clip(alpha01, 0.0, 1.0) * 255.0).round().astype(np.uint8)
@@ -35,18 +37,20 @@ def alpha_to_u8(alpha01: np.ndarray) -> np.ndarray:
 def u8_to_alpha01(a: np.ndarray) -> np.ndarray:
     return a.astype(np.float16) / np.float16(255.0)
 
-def png_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
 def max_abs3(a3: np.ndarray) -> np.ndarray:
-    # a3: [H,W,3]
     return np.max(np.abs(a3), axis=2)
+
+def build_bg_map_lowres(img: Image.Image, blur_radius: float, bg_map_side: int) -> Image.Image:
+    if blur_radius <= 0:
+        return img
+    w, h = img.size
+    small = resize_max(img, max_side=bg_map_side)
+    small_blur = small.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    return small_blur.resize((w, h), Image.BILINEAR)
 
 
 # =========================================================
-# Background-likeness helpers (gating)
+# Floodfill (two-stage) on WHITE key image
 # =========================================================
 
 def is_near_white_rgb(px, tol: int) -> bool:
@@ -57,16 +61,7 @@ def is_near_black_rgb(px, tol: int) -> bool:
     r, g, b = px
     return (r <= tol) and (g <= tol) and (b <= tol)
 
-
-# =========================================================
-# Two-stage floodfill mask from border (memory-safe, 1D)
-# strict seeds + relaxed expansion
-# =========================================================
-
 def floodfill_border_two_stage_1d(img_key: Image.Image, tol_strict: int, tol_relaxed: int) -> bytearray:
-    """
-    Returns mask_1d where 1 means "background connected to border" (on the WHITE image).
-    """
     w, h = img_key.size
     pix = img_key.load()
 
@@ -82,7 +77,7 @@ def floodfill_border_two_stage_1d(img_key: Image.Image, tol_strict: int, tol_rel
             mask[i] = 1
             q.append((x, y))
 
-    # strict seeds on border
+    # strict seeds
     for x in range(w):
         try_seed_strict(x, 0)
         try_seed_strict(x, h - 1)
@@ -90,7 +85,7 @@ def floodfill_border_two_stage_1d(img_key: Image.Image, tol_strict: int, tol_rel
         try_seed_strict(0, y)
         try_seed_strict(w - 1, y)
 
-    # relaxed expansion but only from strict border-connected seeds
+    # relaxed expansion from strict seeds
     while q:
         x, y = q.popleft()
         for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
@@ -104,19 +99,6 @@ def floodfill_border_two_stage_1d(img_key: Image.Image, tol_strict: int, tol_rel
 
 
 # =========================================================
-# Low-res background map for difference matting (gradient-safe, RAM-safe)
-# =========================================================
-
-def build_bg_map_lowres(img: Image.Image, blur_radius: float, bg_map_side: int) -> Image.Image:
-    if blur_radius <= 0:
-        return img
-    w, h = img.size
-    small = resize_max(img, max_side=bg_map_side)
-    small_blur = small.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    return small_blur.resize((w, h), Image.BILINEAR)
-
-
-# =========================================================
 # Routes
 # =========================================================
 
@@ -125,8 +107,17 @@ def health():
     return {"status": "ok", "endpoint": "/matte/hybrid"}
 
 @app.get("/", response_class=HTMLResponse)
-def home():
-    return """
+def home(debug: int = Query(0, ge=0, le=1)):
+    # IMPORTANT: propagate debug into the form action
+    # so opening "/?debug=1" actually triggers debug in POST.
+    action = (
+        f"/matte/hybrid?"
+        f"max_side=2048&tol_strict=28&tol_relaxed=60&black_tol=28&"
+        f"bg_blur=12&bg_map_side=512&denom_min=16&noise_cut=0.012&"
+        f"fg_margin=22&alpha_hard=0.97&debug={debug}"
+    )
+
+    return f"""
 <!doctype html>
 <html>
   <head>
@@ -134,10 +125,24 @@ def home():
     <title>Hybrid Matting Test</title>
   </head>
   <body style="font-family: Arial; max-width: 980px; margin: 40px auto; line-height:1.45;">
-    <h2>Hybrid Matting Test (stable)</h2>
-    <p>Upload <b>white</b> and <b>black</b> versions of the same artwork (pixel-aligned).</p>
+    <h2>Hybrid Matting Test</h2>
+    <p>
+      Tölts fel egy <b>fehér</b> és egy <b>fekete</b> hátteres verziót (pixelpontos egyezés).
+    </p>
 
-    <form action="/matte/hybrid?max_side=2048&tol_strict=28&tol_relaxed=60&black_tol=28&bg_blur=12&bg_map_side=512&noise_cut=0.015&denom_min=16&fg_margin=20&debug=0"
+    <div style="padding:12px; border:1px solid #eee; border-radius:10px; background:#fafafa; margin-bottom:14px;">
+      <b>Debug mód:</b> jelenleg <b>{'BE' if debug==1 else 'KI'}</b>.
+      <br/>
+      <span style="color:#555;">
+        Debug módban a “Generate” után <b>nem PNG</b> jön, hanem egy szöveg (statisztika), ami segít hibát keresni.
+      </span>
+      <br/>
+      <span style="color:#555;">
+        Debug BE: nyisd így: <code>/?debug=1</code> • Debug KI: <code>/</code>
+      </span>
+    </div>
+
+    <form action="{action}"
           method="post" enctype="multipart/form-data"
           style="padding:16px; border:1px solid #ddd; border-radius:10px;">
       <p><b>White image:</b></p>
@@ -148,13 +153,15 @@ def home():
 
       <p style="margin-top:14px;">
         <button type="submit" style="padding:10px 14px; font-weight:bold; cursor:pointer;">
-          Generate Transparent PNG
+          Generate
         </button>
       </p>
     </form>
 
     <p style="color:#777; margin-top:14px;">
-      Tip: If you ever get an empty PNG, set <b>debug=1</b> to see mask/alpha stats.
+      Ha “kopott” a minta: növeld <b>fg_margin</b>-t (22→28), vagy csökkentsd <b>noise_cut</b>-ot (0.012→0.008).
+      <br/>
+      Ha sötétedik/feketedik: emeld <b>alpha_hard</b>-ot (0.97→0.985).
     </p>
   </body>
 </html>
@@ -163,30 +170,31 @@ def home():
 
 @app.post("/matte/hybrid")
 async def hybrid_matte(
-    white_file: UploadFile = File(..., description="Artwork on (near) white background"),
-    black_file: UploadFile = File(..., description="Artwork on (near) black background"),
+    white_file: UploadFile = File(...),
+    black_file: UploadFile = File(...),
 
     max_side: int = Query(MAX_SIDE_DEFAULT, ge=512, le=6000),
 
-    # Floodfill two-stage (on WHITE key image)
+    # Floodfill
     tol_strict: int = Query(28, ge=0, le=255),
     tol_relaxed: int = Query(60, ge=0, le=255),
-
-    # Gating using black image bg-likeness too
     black_tol: int = Query(28, ge=0, le=255),
 
-    # Difference matting (inner edge refinement)
+    # Difference
     bg_blur: float = Query(12.0, ge=0.0, le=64.0),
     bg_map_side: int = Query(BG_MAP_SIDE_DEFAULT, ge=128, le=1024),
-    denom_min: float = Query(16.0, ge=1.0, le=80.0),
+    denom_min: float = Query(16.0, ge=1.0, le=120.0),
 
-    # cleanup
-    noise_cut: float = Query(0.015, ge=0.0, le=0.2),
+    # Cleanup
+    noise_cut: float = Query(0.012, ge=0.0, le=0.2),
 
-    # anti-wear protection
-    fg_margin: float = Query(20.0, ge=0.0, le=120.0),
+    # Anti-wear
+    fg_margin: float = Query(22.0, ge=0.0, le=120.0),
 
-    # debug
+    # Anti-dark: if alpha is already "almost opaque", don't unpremultiply; just keep original color
+    alpha_hard: float = Query(0.97, ge=0.5, le=1.0),
+
+    # Debug
     debug: int = Query(0, ge=0, le=1),
 ):
     try:
@@ -197,13 +205,12 @@ async def hybrid_matte(
         img_b = resize_max(img_b, max_side=max_side)
 
         if img_w.size != img_b.size:
-            return JSONResponse(status_code=400, content={"error": "Images must match size (pixel-aligned)."})
+            return JSONResponse(status_code=400, content={"error": "A két kép mérete nem egyezik (pixelpontos egyezés kell)."})
+
 
         w, h = img_w.size
 
-        # -------------------------------------------------
-        # 1) Floodfill mask on a KEY image (reduces JPG noise)
-        # -------------------------------------------------
+        # 1) Floodfill on key image (reduces JPG noise)
         img_key = img_w.filter(ImageFilter.BoxBlur(0.6))
         if tol_strict >= tol_relaxed:
             tol_strict = max(5, tol_relaxed - 20)
@@ -211,30 +218,26 @@ async def hybrid_matte(
         flood_mask_1d = floodfill_border_two_stage_1d(img_key, tol_strict=tol_strict, tol_relaxed=tol_relaxed)
         flood2d = (np.frombuffer(flood_mask_1d, dtype=np.uint8).reshape(h, w) == 1)
 
-        # -------------------------------------------------
-        # 2) Gate floodfill: only accept as BG if it is BG-like
-        #    BG-like = near-white (on WHITE key) OR near-black (on BLACK)
-        #    This prevents the floodfill from nuking the design.
-        # -------------------------------------------------
-        # Build bg-like masks cheaply via numpy
-        W_u8 = np.array(img_key, dtype=np.uint8)      # key image for whiteness
-        B_u8 = np.array(img_b, dtype=np.uint8)        # black image for blackness
+        # 2) Gating bg: only accept flood bg where it also looks like bg in white or black
+        W_key_u8 = np.array(img_key, dtype=np.uint8)   # only for whiteness check
+        W_u8 = np.array(img_w, dtype=np.uint8)         # ORIGINAL white (for color/alpha logic)
+        B_u8 = np.array(img_b, dtype=np.uint8)         # ORIGINAL black
 
-        white_like = (np.abs(W_u8.astype(np.int16) - 255).max(axis=2) <= tol_relaxed)
+        white_like = (np.abs(W_key_u8.astype(np.int16) - 255).max(axis=2) <= tol_relaxed)
         black_like = (B_u8.max(axis=2) <= black_tol)
 
         bg2d = flood2d & (white_like | black_like)
 
-        # -------------------------------------------------
-        # 3) Difference alpha (conservative)
-        # -------------------------------------------------
+        # 3) Background maps
+        BgW_u8 = np.array(build_bg_map_lowres(img_w, blur_radius=bg_blur, bg_map_side=bg_map_side), dtype=np.uint8)
+        BgB_u8 = np.array(build_bg_map_lowres(img_b, blur_radius=bg_blur, bg_map_side=bg_map_side), dtype=np.uint8)
+
         W = W_u8.astype(np.float16)
         B = B_u8.astype(np.float16)
+        BgW = BgW_u8.astype(np.float16)
+        BgB = BgB_u8.astype(np.float16)
 
-        BgW = pil_to_f16(build_bg_map_lowres(img_w, blur_radius=bg_blur, bg_map_side=bg_map_side))
-        BgB = pil_to_f16(build_bg_map_lowres(img_b, blur_radius=bg_blur, bg_map_side=bg_map_side))
-
-        # distance-based alpha (more stable for texture)
+        # 4) Difference alpha (distance-based, stable)
         diff32 = (W.astype(np.float32) - B.astype(np.float32))
         pix_dist = np.sqrt((diff32 * diff32).sum(axis=2))
 
@@ -245,79 +248,65 @@ async def hybrid_matte(
         alpha = 1.0 - (pix_dist / bg_dist)
         alpha = np.clip(alpha, 0.0, 1.0).astype(np.float16)
 
-        # cleanup temps
-        del diff32, pix_dist, bgdiff32, bg_dist
-        gc.collect()
-
-        # noise cut (light)
+        # 5) Light noise cut
         if noise_cut > 0:
             alpha = np.where(alpha < np.float16(noise_cut), np.float16(0.0), alpha).astype(np.float16)
 
-        # -------------------------------------------------
-        # 4) Anti-wear: protect confident foreground pixels
-        #    If pixel differs from estimated bg enough -> alpha=1
-        # -------------------------------------------------
+        # 6) Anti-wear: protect confident foreground -> alpha=1 (but never on bg2d)
         if fg_margin > 0:
-            dev_w = max_abs3(W - BgW)  # [H,W]
+            dev_w = max_abs3(W - BgW)
             dev_b = max_abs3(B - BgB)
             fg_conf = (dev_w > np.float16(fg_margin)) | (dev_b > np.float16(fg_margin))
             alpha = np.where((~bg2d) & fg_conf, np.float16(1.0), alpha).astype(np.float16)
-            del dev_w, dev_b, fg_conf
-            gc.collect()
 
-        # -------------------------------------------------
-        # 5) Hybrid merge: enforce outer background as 0 alpha
-        # -------------------------------------------------
+        # 7) Enforce background alpha=0
         alpha_u8 = alpha_to_u8(alpha)
         alpha_u8[bg2d] = 0
-        alpha = u8_to_alpha01(alpha_u8)
 
-        # fail-safe: if almost everything is zero, return debug (or fallback)
-        nonzero_ratio = float(np.count_nonzero(alpha_u8)) / float(alpha_u8.size)
+        # ---- Debug mode: ALWAYS return stats instead of PNG ----
         bg_ratio = float(np.count_nonzero(bg2d)) / float(bg2d.size)
+        nonzero_ratio = float(np.count_nonzero(alpha_u8)) / float(alpha_u8.size)
 
-        if nonzero_ratio < 0.01:
-            # fallback: do NOT apply bg2d, only flood2d (stricter) with gating
-            # (This avoids "empty PNG" catastrophes.)
-            alpha_u8_fallback = np.full((h, w), 255, dtype=np.uint8)
-            alpha_u8_fallback[bg2d] = 0
-            nonzero_ratio_fb = float(np.count_nonzero(alpha_u8_fallback)) / float(alpha_u8_fallback.size)
+        if debug == 1:
+            # Also show alpha quantiles to see "worn out" vs "mostly solid"
+            a = alpha_u8.reshape(-1)
+            q = np.quantile(a, [0.0, 0.1, 0.5, 0.9, 1.0]).tolist()
+            return JSONResponse(status_code=200, content={
+                "size": [w, h],
+                "bg_ratio": bg_ratio,
+                "alpha_nonzero_ratio": nonzero_ratio,
+                "alpha_u8_quantiles": {"min,p10,median,p90,max": q},
+                "tips": {
+                    "if_empty_or_nearly_empty": "csökkentsd tol_relaxed (60→55) vagy black_tol (28→20)",
+                    "if_worn_center": "növeld fg_margin (22→28) és/vagy csökkentsd noise_cut (0.012→0.008)",
+                    "if_too_dark_or_black_patches": "emeld alpha_hard (0.97→0.985), és hagyd a bg_blur-t 8–12 között"
+                }
+            })
 
-            if debug == 1:
-                return JSONResponse(status_code=200, content={
-                    "warning": "alpha nearly empty; fallback applied",
-                    "size": [w, h],
-                    "bg_ratio": bg_ratio,
-                    "alpha_nonzero_ratio": nonzero_ratio,
-                    "fallback_alpha_nonzero_ratio": nonzero_ratio_fb,
-                    "tips": [
-                        "Lower tol_relaxed (e.g. 55) or black_tol (e.g. 20) if bg_ratio is too high.",
-                        "Lower noise_cut (e.g. 0.01) if interiors are being eaten.",
-                        "Increase fg_margin (e.g. 24) if design looks worn."
-                    ]
-                })
+        alpha01 = u8_to_alpha01(alpha_u8)
 
-            # apply fallback alpha
-            alpha_u8 = alpha_u8_fallback
-            alpha = u8_to_alpha01(alpha_u8)
+        # 8) Color: avoid darkening.
+        # If alpha is already near-opaque, use original WHITE color (or B); only unpremultiply near edges.
+        a_safe = np.maximum(alpha01, np.float16(1e-3))[..., None]
+        recovered = (B - (np.float16(1.0) - alpha01)[..., None] * BgB) / a_safe
+        recovered = np.clip(recovered, 0.0, 255.0)
 
-        # -------------------------------------------------
-        # 6) Color recovery (background-aware)
-        # -------------------------------------------------
-        a_safe = np.maximum(alpha, np.float16(1e-3))[..., None]
-        out_rgb = (B - (np.float16(1.0) - alpha)[..., None] * BgB) / a_safe
-        out_rgb = np.clip(out_rgb, 0.0, 255.0)
-        out_rgb = np.where(alpha[..., None] <= np.float16(noise_cut), 0.0, out_rgb).astype(np.uint8)
+        # Where alpha is high -> keep original (prevents darkening)
+        hard = (alpha01 >= np.float16(alpha_hard))
+        out_rgb = recovered
+        out_rgb[hard] = W[hard]  # use white version inside solid areas
+
+        # Where alpha ~ 0 -> force RGB=0 to avoid colored dust
+        out_rgb = np.where(alpha01[..., None] <= np.float16(noise_cut), 0.0, out_rgb).astype(np.uint8)
 
         out = Image.fromarray(out_rgb, mode="RGB").convert("RGBA")
         out.putalpha(Image.fromarray(alpha_u8, mode="L"))
 
-        # free big arrays early
-        del W_u8, B_u8, W, B, BgW, BgB, out_rgb, alpha, alpha_u8, flood2d, bg2d, white_like, black_like, flood_mask_1d
+        # cleanup
+        del W_key_u8, W_u8, B_u8, BgW_u8, BgB_u8, W, B, BgW, BgB, diff32, pix_dist, bgdiff32, bg_dist, alpha, alpha_u8
         gc.collect()
 
         return StreamingResponse(io.BytesIO(png_bytes(out)), media_type="image/png")
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Processing failed: {e}"})
-
