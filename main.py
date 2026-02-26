@@ -1,5 +1,4 @@
 import io
-import gc
 from collections import deque
 
 import numpy as np
@@ -7,11 +6,10 @@ from PIL import Image, ImageFilter
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
-app = FastAPI(title="Hybrid Matting API", version="1.5.0")
+app = FastAPI(title="Hybrid Matting API (Floodfill + Hole Diff)", version="2.0.0")
 
 # Render Free safe defaults
 MAX_SIDE_DEFAULT = 2048
-BG_MAP_SIDE_DEFAULT = 512
 
 
 # =========================================================
@@ -31,53 +29,36 @@ def png_bytes(img: Image.Image) -> bytes:
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
-def alpha_to_u8(alpha01: np.ndarray) -> np.ndarray:
-    return (np.clip(alpha01, 0.0, 1.0) * 255.0).round().astype(np.uint8)
-
-def u8_to_alpha01(a: np.ndarray) -> np.ndarray:
-    return a.astype(np.float16) / np.float16(255.0)
-
-def max_abs3(a3: np.ndarray) -> np.ndarray:
-    return np.max(np.abs(a3), axis=2)
-
-def build_bg_map_lowres(img: Image.Image, blur_radius: float, bg_map_side: int) -> Image.Image:
-    if blur_radius <= 0:
-        return img
-    w, h = img.size
-    small = resize_max(img, max_side=bg_map_side)
-    small_blur = small.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    return small_blur.resize((w, h), Image.BILINEAR)
-
-
-# =========================================================
-# Floodfill (two-stage) on WHITE key image
-# =========================================================
-
-def is_near_white_rgb(px, tol: int) -> bool:
+def is_near_white(px, tol: int) -> bool:
     r, g, b = px
     return abs(r - 255) <= tol and abs(g - 255) <= tol and abs(b - 255) <= tol
 
-def is_near_black_rgb(px, tol: int) -> bool:
-    r, g, b = px
-    return (r <= tol) and (g <= tol) and (b <= tol)
 
-def floodfill_border_two_stage_1d(img_key: Image.Image, tol_strict: int, tol_relaxed: int) -> bytearray:
-    w, h = img_key.size
-    pix = img_key.load()
+# =========================================================
+# Two-stage floodfill from border (memory-safe 1D)
+# strict seeds + relaxed expansion
+# =========================================================
+
+def floodfill_border_bg_mask_two_stage_1d(
+    img_for_keying: Image.Image,
+    tol_strict: int,
+    tol_relaxed: int,
+) -> bytearray:
+    w, h = img_for_keying.size
+    pix = img_for_keying.load()
 
     mask = bytearray(w * h)  # 0/1
     q = deque()
 
-    def idx(x, y):
-        return y * w + x
+    def idx(x, y): return y * w + x
 
     def try_seed_strict(x, y):
         i = idx(x, y)
-        if mask[i] == 0 and is_near_white_rgb(pix[x, y], tol_strict):
+        if mask[i] == 0 and is_near_white(pix[x, y], tol_strict):
             mask[i] = 1
             q.append((x, y))
 
-    # strict seeds
+    # strict border seeds
     for x in range(w):
         try_seed_strict(x, 0)
         try_seed_strict(x, h - 1)
@@ -91,11 +72,128 @@ def floodfill_border_two_stage_1d(img_key: Image.Image, tol_strict: int, tol_rel
         for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
             if 0 <= nx < w and 0 <= ny < h:
                 i = idx(nx, ny)
-                if mask[i] == 0 and is_near_white_rgb(pix[nx, ny], tol_relaxed):
+                if mask[i] == 0 and is_near_white(pix[nx, ny], tol_relaxed):
                     mask[i] = 1
                     q.append((nx, ny))
 
     return mask
+
+
+# =========================================================
+# Find enclosed transparent holes (inside FG) using 1D BFS
+# Holes = transparent pixels that are NOT border-connected background
+# We return components (list of indices) for holes only.
+# =========================================================
+
+def find_enclosed_holes(alpha_mask_1d: bytearray, w: int, h: int, min_area: int):
+    """
+    alpha_mask_1d: 1 where background (transparent), 0 where foreground (opaque)
+    We consider holes as background pixels that are NOT connected to border.
+    Returns list of hole components, each as list of 1D indices.
+    """
+    def idx(x, y): return y * w + x
+
+    # visited for background pixels
+    visited = bytearray(w * h)
+
+    # Step 1: mark border-connected background pixels
+    q = deque()
+
+    def enqueue_if_bg(x, y):
+        i = idx(x, y)
+        if visited[i] == 0 and alpha_mask_1d[i] == 1:
+            visited[i] = 1
+            q.append((x, y))
+
+    for x in range(w):
+        enqueue_if_bg(x, 0)
+        enqueue_if_bg(x, h - 1)
+    for y in range(h):
+        enqueue_if_bg(0, y)
+        enqueue_if_bg(w - 1, y)
+
+    while q:
+        x, y = q.popleft()
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < w and 0 <= ny < h:
+                i = idx(nx, ny)
+                if visited[i] == 0 and alpha_mask_1d[i] == 1:
+                    visited[i] = 1
+                    q.append((nx, ny))
+
+    # Step 2: any remaining background pixels (alpha_mask_1d==1 and visited==0) are enclosed holes
+    holes = []
+    hole_vis = bytearray(w * h)
+
+    for y0 in range(h):
+        for x0 in range(w):
+            i0 = idx(x0, y0)
+            if alpha_mask_1d[i0] != 1:
+                continue
+            if visited[i0] == 1:
+                continue
+            if hole_vis[i0] == 1:
+                continue
+
+            comp = []
+            qq = deque([(x0, y0)])
+            hole_vis[i0] = 1
+
+            while qq:
+                x, y = qq.popleft()
+                comp.append(idx(x, y))
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < w and 0 <= ny < h:
+                        ii = idx(nx, ny)
+                        if alpha_mask_1d[ii] == 1 and visited[ii] == 0 and hole_vis[ii] == 0:
+                            hole_vis[ii] = 1
+                            qq.append((nx, ny))
+
+            if len(comp) >= min_area:
+                holes.append(comp)
+
+    return holes
+
+
+# =========================================================
+# Difference alpha (simple + robust enough for HOLES only)
+# We estimate background colors from border-connected background pixels.
+# =========================================================
+
+def estimate_bg_rgb_from_mask(img_rgb_u8: np.ndarray, bg_mask_1d: bytearray) -> np.ndarray:
+    """
+    img_rgb_u8: [H,W,3] uint8
+    bg_mask_1d: 1 where border-connected background
+    Returns bg_rgb float32 shape [3] as median of bg pixels (or fallback).
+    """
+    h, w, _ = img_rgb_u8.shape
+    m = np.frombuffer(bg_mask_1d, dtype=np.uint8).reshape(h, w) == 1
+    if not np.any(m):
+        # fallback: just use corners median-ish
+        corners = np.array([
+            img_rgb_u8[0, 0], img_rgb_u8[0, w - 1],
+            img_rgb_u8[h - 1, 0], img_rgb_u8[h - 1, w - 1]
+        ], dtype=np.float32)
+        return np.median(corners, axis=0)
+    pix = img_rgb_u8[m].astype(np.float32)
+    return np.median(pix, axis=0)
+
+def compute_alpha_dist(W_u8: np.ndarray, B_u8: np.ndarray, bgW: np.ndarray, bgB: np.ndarray) -> np.ndarray:
+    """
+    Returns alpha in [0,1] float32 using distance formula:
+    alpha = 1 - ||W-B|| / ||bgW-bgB||
+    """
+    W = W_u8.astype(np.float32)
+    B = B_u8.astype(np.float32)
+    diff = W - B
+    pix_dist = np.sqrt((diff * diff).sum(axis=2))  # [H,W]
+
+    bg_diff = bgW.astype(np.float32) - bgB.astype(np.float32)
+    bg_dist = float(np.sqrt((bg_diff * bg_diff).sum()))
+    bg_dist = max(bg_dist, 1.0)
+
+    alpha = 1.0 - (pix_dist / bg_dist)
+    return np.clip(alpha, 0.0, 1.0)
 
 
 # =========================================================
@@ -107,42 +205,20 @@ def health():
     return {"status": "ok", "endpoint": "/matte/hybrid"}
 
 @app.get("/", response_class=HTMLResponse)
-def home(debug: int = Query(0, ge=0, le=1)):
-    # IMPORTANT: propagate debug into the form action
-    # so opening "/?debug=1" actually triggers debug in POST.
-    action = (
-        f"/matte/hybrid?"
-        f"max_side=2048&tol_strict=28&tol_relaxed=60&black_tol=28&"
-        f"bg_blur=12&bg_map_side=512&denom_min=16&noise_cut=0.012&"
-        f"fg_margin=22&alpha_hard=0.97&debug={debug}"
-    )
-
-    return f"""
+def home():
+    return """
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8">
-    <title>Hybrid Matting Test</title>
-  </head>
+  <head><meta charset="utf-8"><title>Hybrid Matting Test</title></head>
   <body style="font-family: Arial; max-width: 980px; margin: 40px auto; line-height:1.45;">
-    <h2>Hybrid Matting Test</h2>
+    <h2>Hybrid Matting Test (Floodfill outer + Diff holes)</h2>
     <p>
-      Tölts fel egy <b>fehér</b> és egy <b>fekete</b> hátteres verziót (pixelpontos egyezés).
+      Feltöltöd a <b>fehér</b> és a <b>fekete</b> hátteres képet (pixelpontos egyezés).
+      <br/>
+      Külső háttér: bevált floodfill. Belső lyukak: difference matting csak ott, ahol kell.
     </p>
 
-    <div style="padding:12px; border:1px solid #eee; border-radius:10px; background:#fafafa; margin-bottom:14px;">
-      <b>Debug mód:</b> jelenleg <b>{'BE' if debug==1 else 'KI'}</b>.
-      <br/>
-      <span style="color:#555;">
-        Debug módban a “Generate” után <b>nem PNG</b> jön, hanem egy szöveg (statisztika), ami segít hibát keresni.
-      </span>
-      <br/>
-      <span style="color:#555;">
-        Debug BE: nyisd így: <code>/?debug=1</code> • Debug KI: <code>/</code>
-      </span>
-    </div>
-
-    <form action="{action}"
+    <form action="/matte/hybrid?max_side=2048&tol_strict=28&tol_relaxed=60&hole_fill=1&min_hole_area=120&hole_alpha_thresh=0.18&debug=0"
           method="post" enctype="multipart/form-data"
           style="padding:16px; border:1px solid #ddd; border-radius:10px;">
       <p><b>White image:</b></p>
@@ -153,15 +229,15 @@ def home(debug: int = Query(0, ge=0, le=1)):
 
       <p style="margin-top:14px;">
         <button type="submit" style="padding:10px 14px; font-weight:bold; cursor:pointer;">
-          Generate
+          Generate Transparent PNG
         </button>
       </p>
     </form>
 
     <p style="color:#777; margin-top:14px;">
-      Ha “kopott” a minta: növeld <b>fg_margin</b>-t (22→28), vagy csökkentsd <b>noise_cut</b>-ot (0.012→0.008).
+      Ha belül “lyukak” maradnak: emeld <b>hole_alpha_thresh</b>-t (0.18→0.22) vagy csökkentsd <b>min_hole_area</b>-t (120→60).
       <br/>
-      Ha sötétedik/feketedik: emeld <b>alpha_hard</b>-ot (0.97→0.985).
+      Ha a minta belsejét is kitölti feleslegesen: emeld <b>min_hole_area</b>-t (120→250).
     </p>
   </body>
 </html>
@@ -175,24 +251,14 @@ async def hybrid_matte(
 
     max_side: int = Query(MAX_SIDE_DEFAULT, ge=512, le=6000),
 
-    # Floodfill
+    # Floodfill settings (outer bg)
     tol_strict: int = Query(28, ge=0, le=255),
     tol_relaxed: int = Query(60, ge=0, le=255),
-    black_tol: int = Query(28, ge=0, le=255),
 
-    # Difference
-    bg_blur: float = Query(12.0, ge=0.0, le=64.0),
-    bg_map_side: int = Query(BG_MAP_SIDE_DEFAULT, ge=128, le=1024),
-    denom_min: float = Query(16.0, ge=1.0, le=120.0),
-
-    # Cleanup
-    noise_cut: float = Query(0.012, ge=0.0, le=0.2),
-
-    # Anti-wear
-    fg_margin: float = Query(22.0, ge=0.0, le=120.0),
-
-    # Anti-dark: if alpha is already "almost opaque", don't unpremultiply; just keep original color
-    alpha_hard: float = Query(0.97, ge=0.5, le=1.0),
+    # Hole fill via difference
+    hole_fill: int = Query(1, ge=0, le=1),
+    min_hole_area: int = Query(120, ge=1, le=500000),
+    hole_alpha_thresh: float = Query(0.18, ge=0.0, le=1.0),
 
     # Debug
     debug: int = Query(0, ge=0, le=1),
@@ -210,101 +276,82 @@ async def hybrid_matte(
 
         w, h = img_w.size
 
-        # 1) Floodfill on key image (reduces JPG noise)
+        # --- Floodfill outer background (BEVÁLT IRÁNY) ---
         img_key = img_w.filter(ImageFilter.BoxBlur(0.6))
         if tol_strict >= tol_relaxed:
             tol_strict = max(5, tol_relaxed - 20)
 
-        flood_mask_1d = floodfill_border_two_stage_1d(img_key, tol_strict=tol_strict, tol_relaxed=tol_relaxed)
-        flood2d = (np.frombuffer(flood_mask_1d, dtype=np.uint8).reshape(h, w) == 1)
+        border_bg_1d = floodfill_border_bg_mask_two_stage_1d(
+            img_for_keying=img_key,
+            tol_strict=tol_strict,
+            tol_relaxed=tol_relaxed,
+        )
 
-        # 2) Gating bg: only accept flood bg where it also looks like bg in white or black
-        W_key_u8 = np.array(img_key, dtype=np.uint8)   # only for whiteness check
-        W_u8 = np.array(img_w, dtype=np.uint8)         # ORIGINAL white (for color/alpha logic)
-        B_u8 = np.array(img_b, dtype=np.uint8)         # ORIGINAL black
+        # alpha_mask_1d: 1 for bg (transparent), 0 for fg (opaque)
+        alpha_mask_1d = border_bg_1d[:]  # copy
 
-        white_like = (np.abs(W_key_u8.astype(np.int16) - 255).max(axis=2) <= tol_relaxed)
-        black_like = (B_u8.max(axis=2) <= black_tol)
+        # --- Optional: fill enclosed holes using difference alpha only on holes ---
+        filled_holes = 0
+        hole_components = 0
 
-        bg2d = flood2d & (white_like | black_like)
+        W_u8 = np.array(img_w, dtype=np.uint8)
+        B_u8 = np.array(img_b, dtype=np.uint8)
 
-        # 3) Background maps
-        BgW_u8 = np.array(build_bg_map_lowres(img_w, blur_radius=bg_blur, bg_map_side=bg_map_side), dtype=np.uint8)
-        BgB_u8 = np.array(build_bg_map_lowres(img_b, blur_radius=bg_blur, bg_map_side=bg_map_side), dtype=np.uint8)
+        if hole_fill == 1:
+            holes = find_enclosed_holes(alpha_mask_1d, w, h, min_area=min_hole_area)
+            hole_components = len(holes)
 
-        W = W_u8.astype(np.float16)
-        B = B_u8.astype(np.float16)
-        BgW = BgW_u8.astype(np.float16)
-        BgB = BgB_u8.astype(np.float16)
+            if hole_components > 0:
+                # estimate background colors from BORDER-connected background pixels
+                bgW = estimate_bg_rgb_from_mask(W_u8, border_bg_1d)
+                bgB = estimate_bg_rgb_from_mask(B_u8, border_bg_1d)
 
-        # 4) Difference alpha (distance-based, stable)
-        diff32 = (W.astype(np.float32) - B.astype(np.float32))
-        pix_dist = np.sqrt((diff32 * diff32).sum(axis=2))
+                # compute alpha_diff for whole image (cheap enough at 2K)
+                alpha_diff = compute_alpha_dist(W_u8, B_u8, bgW=bgW, bgB=bgB)  # [H,W] float32
 
-        bgdiff32 = (BgW.astype(np.float32) - BgB.astype(np.float32))
-        bg_dist = np.sqrt((bgdiff32 * bgdiff32).sum(axis=2))
-        bg_dist = np.maximum(bg_dist, float(denom_min))
+                # For each hole component, decide fill pixel-by-pixel using alpha_diff threshold
+                for comp in holes:
+                    for ii in comp:
+                        x = ii % w
+                        y = ii // w
+                        if alpha_diff[y, x] >= hole_alpha_thresh:
+                            # fill this hole pixel => make it opaque
+                            alpha_mask_1d[ii] = 0
+                            filled_holes += 1
 
-        alpha = 1.0 - (pix_dist / bg_dist)
-        alpha = np.clip(alpha, 0.0, 1.0).astype(np.float16)
+        # --- Build output RGBA using WHITE image colors (NO color recovery = NO distortion) ---
+        out = img_w.convert("RGBA")
+        p = out.load()
 
-        # 5) Light noise cut
-        if noise_cut > 0:
-            alpha = np.where(alpha < np.float16(noise_cut), np.float16(0.0), alpha).astype(np.float16)
-
-        # 6) Anti-wear: protect confident foreground -> alpha=1 (but never on bg2d)
-        if fg_margin > 0:
-            dev_w = max_abs3(W - BgW)
-            dev_b = max_abs3(B - BgB)
-            fg_conf = (dev_w > np.float16(fg_margin)) | (dev_b > np.float16(fg_margin))
-            alpha = np.where((~bg2d) & fg_conf, np.float16(1.0), alpha).astype(np.float16)
-
-        # 7) Enforce background alpha=0
-        alpha_u8 = alpha_to_u8(alpha)
-        alpha_u8[bg2d] = 0
-
-        # ---- Debug mode: ALWAYS return stats instead of PNG ----
-        bg_ratio = float(np.count_nonzero(bg2d)) / float(bg2d.size)
-        nonzero_ratio = float(np.count_nonzero(alpha_u8)) / float(alpha_u8.size)
+        i = 0
+        for y in range(h):
+            for x in range(w):
+                r, g, b, _ = p[x, y]
+                a = 0 if alpha_mask_1d[i] == 1 else 255
+                p[x, y] = (r, g, b, a)
+                i += 1
 
         if debug == 1:
-            # Also show alpha quantiles to see "worn out" vs "mostly solid"
-            a = alpha_u8.reshape(-1)
-            q = np.quantile(a, [0.0, 0.1, 0.5, 0.9, 1.0]).tolist()
+            bg_ratio = float(sum(alpha_mask_1d)) / float(len(alpha_mask_1d))
             return JSONResponse(status_code=200, content={
                 "size": [w, h],
                 "bg_ratio": bg_ratio,
-                "alpha_nonzero_ratio": nonzero_ratio,
-                "alpha_u8_quantiles": {"min,p10,median,p90,max": q},
+                "hole_components": hole_components,
+                "hole_pixels_filled": filled_holes,
+                "params": {
+                    "max_side": max_side,
+                    "tol_strict": tol_strict,
+                    "tol_relaxed": tol_relaxed,
+                    "hole_fill": hole_fill,
+                    "min_hole_area": min_hole_area,
+                    "hole_alpha_thresh": hole_alpha_thresh,
+                },
                 "tips": {
-                    "if_empty_or_nearly_empty": "csökkentsd tol_relaxed (60→55) vagy black_tol (28→20)",
-                    "if_worn_center": "növeld fg_margin (22→28) és/vagy csökkentsd noise_cut (0.012→0.008)",
-                    "if_too_dark_or_black_patches": "emeld alpha_hard (0.97→0.985), és hagyd a bg_blur-t 8–12 között"
+                    "if_outer_bg_is_perfect_keep_it": "Külső háttérnél csak a tol_relaxed-et finomítsd (55–75).",
+                    "if_holes_remain": "Csökkentsd min_hole_area-t (120→60) vagy csökkentsd hole_alpha_thresh-et (0.18→0.14).",
+                    "if_false_fills_inside_design": "Emeld min_hole_area-t (120→250) vagy emeld hole_alpha_thresh-et (0.18→0.22)."
                 }
             })
-
-        alpha01 = u8_to_alpha01(alpha_u8)
-
-        # 8) Color: avoid darkening.
-        # If alpha is already near-opaque, use original WHITE color (or B); only unpremultiply near edges.
-        a_safe = np.maximum(alpha01, np.float16(1e-3))[..., None]
-        recovered = (B - (np.float16(1.0) - alpha01)[..., None] * BgB) / a_safe
-        recovered = np.clip(recovered, 0.0, 255.0)
-
-        # Where alpha is high -> keep original (prevents darkening)
-        hard = (alpha01 >= np.float16(alpha_hard))
-        out_rgb = recovered
-        out_rgb[hard] = W[hard]  # use white version inside solid areas
-
-        # Where alpha ~ 0 -> force RGB=0 to avoid colored dust
-        out_rgb = np.where(alpha01[..., None] <= np.float16(noise_cut), 0.0, out_rgb).astype(np.uint8)
-
-        out = Image.fromarray(out_rgb, mode="RGB").convert("RGBA")
-        out.putalpha(Image.fromarray(alpha_u8, mode="L"))
-
-        # cleanup
-        del W_key_u8, W_u8, B_u8, BgW_u8, BgB_u8, W, B, BgW, BgB, diff32, pix_dist, bgdiff32, bg_dist, alpha, alpha_u8
-        gc.collect()
 
         return StreamingResponse(io.BytesIO(png_bytes(out)), media_type="image/png")
 
